@@ -15,6 +15,7 @@ defmodule MoyaDB.APITest do
 
   setup do
     MoyaDB.flush()
+    MoyaDB.Metrics.reset()
     :ok
   end
 
@@ -213,6 +214,48 @@ defmodule MoyaDB.APITest do
       conn = api(:get, "/db/v0.1/something/else")
 
       assert conn.status == 404
+    end
+  end
+
+  describe "GET /db/v0.1/metrics" do
+    test "returns rolling inbound counts and health latency percentiles" do
+      api(:post, "/db/v0.1/m1", %{"v" => 1})
+      api(:get, "/db/v0.1/m1")
+      api(:delete, "/db/v0.1/m1")
+      api(:get, "/db/v0.1/missing")
+
+      conn = api(:get, "/db/v0.1/metrics")
+
+      assert conn.status == 200
+      body = json(conn)
+
+      assert body["window_ms"] == 1_000
+      assert is_integer(body["timestamp"])
+      assert body["role"] == "database"
+      assert body["db_id"] == "db-1"
+
+      inbound = body["inbound"]
+      assert inbound["query_count"] == 4
+      assert inbound["responses"]["2xx"] == 3
+      assert inbound["responses"]["4xx"] == 1
+      assert inbound["responses"]["5xx"] == 0
+      assert inbound["last_status"] == 404
+
+      health = body["health"]
+      assert health["ready"] == true
+      assert is_number(health["latency_ms_p50"])
+      assert is_number(health["latency_ms_p95"])
+      assert health["latency_ms_p50"] <= health["latency_ms_p95"]
+    end
+
+    test "does not count the metrics endpoint itself as inbound traffic" do
+      api(:post, "/db/v0.1/only_once", %{"v" => true})
+
+      first = api(:get, "/db/v0.1/metrics") |> json()
+      second = api(:get, "/db/v0.1/metrics") |> json()
+
+      assert first["inbound"]["query_count"] == 1
+      assert second["inbound"]["query_count"] == 1
     end
   end
 end

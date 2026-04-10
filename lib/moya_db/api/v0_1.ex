@@ -6,6 +6,9 @@ defmodule MoyaDB.API.V0_1 do
 
   ## Endpoints
 
+      GET    /db/v0.1/metrics
+                             Return rolling inbound query and latency metrics.
+
       GET    /db/v0.1/:key   Return the value stored at `key` as JSON.
                              404 if the key does not exist.
 
@@ -33,30 +36,78 @@ defmodule MoyaDB.API.V0_1 do
 
   use Plug.Router
 
+  @json_headers [{"content-type", "application/json; charset=utf-8"}]
+
+  plug :put_request_start
   plug :match
   plug :dispatch
 
-  get "/:key" do
-    conn = put_resp_content_type(conn, "application/json")
+  @spec handle_request(map()) :: %{status: integer(), headers: [{binary(), binary()}], body: term()}
+  def handle_request(%{method: method, path: path} = request)
+      when is_binary(method) and is_binary(path) do
+    case {String.upcase(method), parse_path(path)} do
+      {"GET", :metrics} ->
+        %{status: 200, headers: @json_headers, body: MoyaDB.Metrics.snapshot()}
 
-    case MoyaDB.get(key) do
-      {:ok, value} ->
-        case Jason.encode(%{key: key, value: value}) do
-          {:ok, json} ->
-            send_resp(conn, 200, json)
+      {"GET", {:ok, key}} ->
+        case MoyaDB.get(key) do
+          {:ok, value} ->
+            body = %{key: key, value: value}
 
-          {:error, _} ->
-            send_resp(conn, 422, Jason.encode!(%{error: "stored value is not JSON-serializable"}))
+            case Jason.encode(body) do
+              {:ok, _} -> %{status: 200, headers: @json_headers, body: body}
+              {:error, _} -> %{status: 422, headers: @json_headers, body: %{error: "stored value is not JSON-serializable"}}
+            end
+
+          :error ->
+            %{status: 404, headers: @json_headers, body: %{error: "key not found"}}
         end
 
+      {"POST", {:ok, key}} ->
+        value =
+          case Map.get(request, :body) do
+            %{"_json" => v} -> v
+            v -> v
+          end
+
+        :ok = MoyaDB.put(key, value)
+        %{status: 200, headers: @json_headers, body: %{key: key, value: value}}
+
+      {"DELETE", {:ok, key}} ->
+        case MoyaDB.get(key) do
+          {:ok, _} ->
+            :ok = MoyaDB.delete(key)
+            %{status: 200, headers: @json_headers, body: %{key: key, deleted: true}}
+
+          :error ->
+            %{status: 404, headers: @json_headers, body: %{error: "key not found"}}
+        end
+
+      {_method, :error} ->
+        %{status: 404, headers: @json_headers, body: %{error: "not found"}}
+
+      {other_method, {:ok, _key}} ->
+        %{status: 405, headers: @json_headers, body: %{error: "method not allowed", method: other_method}}
+    end
+  end
+
+  def handle_request(_request), do: %{status: 400, headers: @json_headers, body: %{error: "invalid request"}}
+
+  get "/metrics" do
+    respond_json(conn, 200, MoyaDB.Metrics.snapshot())
+  end
+
+  get "/:key" do
+    case MoyaDB.get(key) do
+      {:ok, value} ->
+        respond_json(conn, 200, %{key: key, value: value})
+
       :error ->
-        send_resp(conn, 404, Jason.encode!(%{error: "key not found"}))
+        respond_json(conn, 404, %{error: "key not found"})
     end
   end
 
   post "/:key" do
-    conn = put_resp_content_type(conn, "application/json")
-
     # Plug.Parsers wraps non-object JSON (strings, arrays, numbers) under
     # the "_json" key; unwrap it so we store the actual value.
     value =
@@ -66,25 +117,57 @@ defmodule MoyaDB.API.V0_1 do
       end
 
     :ok = MoyaDB.put(key, value)
-    send_resp(conn, 200, Jason.encode!(%{key: key, value: value}))
+    respond_json(conn, 200, %{key: key, value: value})
   end
 
   delete "/:key" do
-    conn = put_resp_content_type(conn, "application/json")
-
     case MoyaDB.get(key) do
       {:ok, _} ->
         :ok = MoyaDB.delete(key)
-        send_resp(conn, 200, Jason.encode!(%{key: key, deleted: true}))
+        respond_json(conn, 200, %{key: key, deleted: true})
 
       :error ->
-        send_resp(conn, 404, Jason.encode!(%{error: "key not found"}))
+        respond_json(conn, 404, %{error: "key not found"})
     end
   end
 
   match _ do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(404, Jason.encode!(%{error: "not found"}))
+    respond_json(conn, 404, %{error: "not found"})
+  end
+
+  defp parse_path("/metrics"), do: :metrics
+
+  defp parse_path(path) when is_binary(path) do
+    case String.split(path, "/", trim: true) do
+      [key] -> {:ok, URI.decode(key)}
+      _ -> :error
+    end
+  end
+
+  defp put_request_start(conn, _opts) do
+    assign(conn, :request_start_native, System.monotonic_time())
+  end
+
+  defp respond_json(conn, status, body) do
+    conn = put_resp_content_type(conn, "application/json")
+
+    {status, payload} =
+      case Jason.encode(body) do
+        {:ok, json} -> {status, json}
+        {:error, _} -> {422, Jason.encode!(%{error: "response is not JSON-serializable"})}
+      end
+
+    maybe_record_metrics(conn, status)
+    send_resp(conn, status, payload)
+  end
+
+  defp maybe_record_metrics(conn, status) do
+    if conn.request_path != "/db/v0.1/metrics" do
+      start_native = conn.assigns[:request_start_native] || System.monotonic_time()
+      latency_ms = System.convert_time_unit(System.monotonic_time() - start_native, :native, :microsecond) / 1000
+      MoyaDB.Metrics.record(status, latency_ms)
+    end
+
+    :ok
   end
 end

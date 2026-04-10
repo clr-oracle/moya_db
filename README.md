@@ -2,6 +2,24 @@
 
 Distributed key-value database built on Elixir/OTP.
 
+Canonical repository:
+
+- https://github.com/clr/moya
+
+Related repositories:
+
+- Deployment/orchestration: https://github.com/clr/moya_harness
+- Load generator: https://github.com/clr/moya_squeezer
+
+## Multi-service deployment
+
+For running the full stack (`moya_db` + `moya_squeezer` manager/workers), use
+the deployment harness:
+
+- https://github.com/clr/moya_harness
+
+This repo remains focused on the database service itself.
+
 ## Run as a managed release service (Design #3)
 
 This project now supports clean release-based lifecycle commands via

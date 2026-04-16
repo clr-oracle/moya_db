@@ -2,6 +2,14 @@
 
 Distributed key-value database built on Elixir/OTP.
 
+Current implementation notes:
+
+- Values are stored in-memory in a GenServer on each node.
+- Value data is replicated to connected peers asynchronously.
+- Mnesia is used for cluster membership metadata, not as the value store.
+- Value data is not durable across node restart.
+- Reconnect anti-entropy now preserves deletes and flushes with versioned tombstones and a reset watermark, but this is still not consensus-based replication.
+
 Canonical repository:
 
 - https://github.com/clr/moya
@@ -19,6 +27,19 @@ the deployment harness:
 - https://github.com/clr/moya_harness
 
 This repo remains focused on the database service itself.
+
+## Behavior and guarantees
+
+- `POST /db/v0.1/:key` stores any JSON value under the key.
+- `GET /db/v0.1/:key` returns the stored value if it is still JSON-serializable.
+- `DELETE /db/v0.1/:key` removes the key in a single store operation and replicates a tombstone so reconnect does not revive stale state.
+- `GET /db/v0.1/metrics` reports rolling inbound request counts and latency percentiles.
+
+Operational caveats:
+
+- Replication is asynchronous, so a successful write only confirms the local node has accepted the change.
+- There is no consensus layer, so concurrent partitions can still produce last-writer-wins outcomes based on version order.
+- Flush and delete behavior are protected against reconnect resurrection, but distributed correctness still needs staged multi-node validation under real partitions and restarts.
 
 ## Run as a managed release service (Design #3)
 

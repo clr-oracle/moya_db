@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 ENV MIX_ENV=prod
 
 # Install Hex/Rebar and fetch deps first for better layer caching
-RUN mix local.hex --force && mix local.rebar --force
+RUN mix local.hex --force --if-missing && mix local.rebar --force
 
 COPY mix.exs mix.lock ./
 COPY config config

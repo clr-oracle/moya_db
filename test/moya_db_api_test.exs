@@ -258,4 +258,41 @@ defmodule MoyaDB.APITest do
       assert second["inbound"]["query_count"] == 1
     end
   end
+
+  describe "handle_request/1 parity" do
+    test "returns the same 422 body for non-JSON-serializable stored values" do
+      MoyaDB.put("opaque", %{value: self()})
+
+      conn = api(:get, "/db/v0.1/opaque")
+
+      response =
+        MoyaDB.API.handle_request(%{
+          method: "GET",
+          path: "/db/v0.1/opaque"
+        })
+
+      assert conn.status == 422
+      assert json(conn)["error"] == "stored value is not JSON-serializable"
+      assert response.status == 422
+      assert response.body == %{error: "stored value is not JSON-serializable"}
+    end
+
+    test "uses single-step delete semantics consistently" do
+      api(:post, "/db/v0.1/delete_me_conn", %{"v" => 1})
+      api(:post, "/db/v0.1/delete_me_handle", %{"v" => 1})
+
+      conn = api(:delete, "/db/v0.1/delete_me_conn")
+
+      response =
+        MoyaDB.API.handle_request(%{
+          method: "DELETE",
+          path: "/db/v0.1/delete_me_handle"
+        })
+
+      assert conn.status == 200
+      assert json(conn) == %{"deleted" => true, "key" => "delete_me_conn"}
+      assert response.status == 200
+      assert response.body == %{key: "delete_me_handle", deleted: true}
+    end
+  end
 end

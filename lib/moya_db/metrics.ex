@@ -7,6 +7,7 @@ defmodule MoyaDB.Metrics do
 
   @default_window_ms 1_000
   @default_db_id "db-1"
+  @default_latency_reservoir_size 1_024
 
   # --- Public API -----------------------------------------------------------
 
@@ -35,34 +36,48 @@ defmodule MoyaDB.Metrics do
   def init(_opts) do
     window_ms = Application.get_env(:moya_db, :metrics_window_ms, @default_window_ms)
     db_id = Application.get_env(:moya_db, :db_id, @default_db_id)
+    latency_reservoir_size =
+      Application.get_env(:moya_db, :metrics_latency_reservoir_size, @default_latency_reservoir_size)
 
     {:ok,
      %{
        window_ms: window_ms,
        db_id: db_id,
-       samples: []
+       status_samples: :queue.new(),
+       latency_samples: :queue.new(),
+       latency_reservoir_size: latency_reservoir_size
      }}
   end
 
   @impl true
   def handle_cast({:record, status, latency_ms}, state) do
     now = System.system_time(:millisecond)
-    sample = {now, status, latency_ms}
-    samples = prune([sample | state.samples], state.window_ms, now)
-    {:noreply, %{state | samples: samples}}
+    status_samples =
+      {now, status}
+      |> :queue.in(state.status_samples)
+      |> prune_queue(state.window_ms, now)
+
+    latency_samples =
+      {now, latency_ms}
+      |> :queue.in(state.latency_samples)
+      |> prune_queue(state.window_ms, now)
+      |> cap_queue(state.latency_reservoir_size)
+
+    {:noreply, %{state | status_samples: status_samples, latency_samples: latency_samples}}
   end
 
   def handle_cast(:reset, state) do
-    {:noreply, %{state | samples: []}}
+    {:noreply, %{state | status_samples: :queue.new(), latency_samples: :queue.new()}}
   end
 
   @impl true
   def handle_call(:snapshot, _from, state) do
     now = System.system_time(:millisecond)
-    samples = prune(state.samples, state.window_ms, now)
+    status_samples = prune_queue(state.status_samples, state.window_ms, now)
+    latency_samples = prune_queue(state.latency_samples, state.window_ms, now)
 
-    statuses = Enum.map(samples, fn {_ts, status, _latency} -> status end)
-    latencies = Enum.map(samples, fn {_ts, _status, latency} -> latency end)
+    statuses = queue_values(status_samples)
+    latencies = queue_values(latency_samples)
 
     response = %{
       "window_ms" => state.window_ms,
@@ -70,13 +85,13 @@ defmodule MoyaDB.Metrics do
       "role" => "database",
       "db_id" => state.db_id,
       "inbound" => %{
-        "query_count" => length(samples),
+        "query_count" => length(statuses),
         "responses" => %{
           "2xx" => count_bucket(statuses, 200, 299),
           "4xx" => count_bucket(statuses, 400, 499),
           "5xx" => count_bucket(statuses, 500, 599)
         },
-        "last_status" => last_status(samples)
+        "last_status" => List.last(statuses)
       },
       "health" => %{
         "ready" => true,
@@ -85,26 +100,33 @@ defmodule MoyaDB.Metrics do
       }
     }
 
-    {:reply, response, %{state | samples: samples}}
+    {:reply, response, %{state | status_samples: status_samples, latency_samples: latency_samples}}
   end
 
   # --- Private helpers ------------------------------------------------------
 
-  defp prune(samples, window_ms, now) do
+  defp prune_queue(queue, window_ms, now) do
     cutoff = now - window_ms
-    Enum.filter(samples, fn {ts, _status, _latency} -> ts >= cutoff end)
+
+    case :queue.peek(queue) do
+      {:value, {ts, _value}} when ts < cutoff ->
+        queue
+        |> :queue.drop()
+        |> prune_queue(window_ms, now)
+
+      _ ->
+        queue
+    end
   end
 
-  defp count_bucket(statuses, min, max) do
-    Enum.count(statuses, fn status -> status >= min and status <= max end)
-  end
-
-  defp last_status([]), do: nil
-
-  defp last_status(samples) do
-    samples
-    |> Enum.max_by(fn {ts, _status, _latency} -> ts end)
-    |> elem(1)
+  defp cap_queue(queue, max_size) do
+    if :queue.len(queue) > max_size do
+      queue
+      |> :queue.drop()
+      |> cap_queue(max_size)
+    else
+      queue
+    end
   end
 
   defp percentile([], _p), do: 0.0
@@ -116,5 +138,15 @@ defmodule MoyaDB.Metrics do
     index = max(index, 0)
     value = Enum.at(sorted, index)
     Float.round(value * 1.0, 1)
+  end
+
+  defp queue_values(queue) do
+    queue
+    |> :queue.to_list()
+    |> Enum.map(fn {_ts, value} -> value end)
+  end
+
+  defp count_bucket(statuses, min, max) do
+    Enum.count(statuses, fn status -> status >= min and status <= max end)
   end
 end

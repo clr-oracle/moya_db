@@ -45,90 +45,30 @@ defmodule MoyaDB.API.V0_1 do
   @spec handle_request(map()) :: %{status: integer(), headers: [{binary(), binary()}], body: term()}
   def handle_request(%{method: method, path: path} = request)
       when is_binary(method) and is_binary(path) do
-    case {String.upcase(method), parse_path(path)} do
-      {"GET", :metrics} ->
-        %{status: 200, headers: @json_headers, body: MoyaDB.Metrics.snapshot()}
-
-      {"GET", {:ok, key}} ->
-        case MoyaDB.get(key) do
-          {:ok, value} ->
-            body = %{key: key, value: value}
-
-            case Jason.encode(body) do
-              {:ok, _} -> %{status: 200, headers: @json_headers, body: body}
-              {:error, _} -> %{status: 422, headers: @json_headers, body: %{error: "stored value is not JSON-serializable"}}
-            end
-
-          :error ->
-            %{status: 404, headers: @json_headers, body: %{error: "key not found"}}
-        end
-
-      {"POST", {:ok, key}} ->
-        value =
-          case Map.get(request, :body) do
-            %{"_json" => v} -> v
-            v -> v
-          end
-
-        :ok = MoyaDB.put(key, value)
-        %{status: 200, headers: @json_headers, body: %{key: key, value: value}}
-
-      {"DELETE", {:ok, key}} ->
-        case MoyaDB.get(key) do
-          {:ok, _} ->
-            :ok = MoyaDB.delete(key)
-            %{status: 200, headers: @json_headers, body: %{key: key, deleted: true}}
-
-          :error ->
-            %{status: 404, headers: @json_headers, body: %{error: "key not found"}}
-        end
-
-      {_method, :error} ->
-        %{status: 404, headers: @json_headers, body: %{error: "not found"}}
-
-      {other_method, {:ok, _key}} ->
-        %{status: 405, headers: @json_headers, body: %{error: "method not allowed", method: other_method}}
-    end
+    result = execute_request(String.upcase(method), path, Map.get(request, :body))
+    %{status: result.status, headers: @json_headers, body: result.body}
   end
 
   def handle_request(_request), do: %{status: 400, headers: @json_headers, body: %{error: "invalid request"}}
 
   get "/metrics" do
-    respond_json(conn, 200, MoyaDB.Metrics.snapshot())
+    result = execute_request("GET", "/metrics", nil)
+    respond_json(conn, result.status, result.body)
   end
 
   get "/:key" do
-    case MoyaDB.get(key) do
-      {:ok, value} ->
-        respond_json(conn, 200, %{key: key, value: value})
-
-      :error ->
-        respond_json(conn, 404, %{error: "key not found"})
-    end
+    result = execute_request("GET", "/" <> key, nil)
+    respond_json(conn, result.status, result.body)
   end
 
   post "/:key" do
-    # Plug.Parsers wraps non-object JSON (strings, arrays, numbers) under
-    # the "_json" key; unwrap it so we store the actual value.
-    value =
-      case conn.body_params do
-        %{"_json" => v} -> v
-        v -> v
-      end
-
-    :ok = MoyaDB.put(key, value)
-    respond_json(conn, 200, %{key: key, value: value})
+    result = execute_request("POST", "/" <> key, conn.body_params)
+    respond_json(conn, result.status, result.body)
   end
 
   delete "/:key" do
-    case MoyaDB.get(key) do
-      {:ok, _} ->
-        :ok = MoyaDB.delete(key)
-        respond_json(conn, 200, %{key: key, deleted: true})
-
-      :error ->
-        respond_json(conn, 404, %{error: "key not found"})
-    end
+    result = execute_request("DELETE", "/" <> key, nil)
+    respond_json(conn, result.status, result.body)
   end
 
   match _ do
@@ -143,6 +83,51 @@ defmodule MoyaDB.API.V0_1 do
       _ -> :error
     end
   end
+
+  defp execute_request(method, path, body) do
+    case {method, parse_path(path)} do
+      {"GET", :metrics} ->
+        %{status: 200, body: MoyaDB.Metrics.snapshot()}
+
+      {"GET", {:ok, key}} ->
+        get_key(key)
+
+      {"POST", {:ok, key}} ->
+        value = unwrap_json_value(body)
+        :ok = MoyaDB.put(key, value)
+        %{status: 200, body: %{key: key, value: value}}
+
+      {"DELETE", {:ok, key}} ->
+        case MoyaDB.delete(key) do
+          {:ok, _value} -> %{status: 200, body: %{key: key, deleted: true}}
+          :error -> %{status: 404, body: %{error: "key not found"}}
+        end
+
+      {_method, :error} ->
+        %{status: 404, body: %{error: "not found"}}
+
+      {other_method, {:ok, _key}} ->
+        %{status: 405, body: %{error: "method not allowed", method: other_method}}
+    end
+  end
+
+  defp get_key(key) do
+    case MoyaDB.get(key) do
+      {:ok, value} ->
+        body = %{key: key, value: value}
+
+        case Jason.encode(body) do
+          {:ok, _} -> %{status: 200, body: body}
+          {:error, _} -> %{status: 422, body: %{error: "stored value is not JSON-serializable"}}
+        end
+
+      :error ->
+        %{status: 404, body: %{error: "key not found"}}
+    end
+  end
+
+  defp unwrap_json_value(%{"_json" => value}), do: value
+  defp unwrap_json_value(value), do: value
 
   defp put_request_start(conn, _opts) do
     assign(conn, :request_start_native, System.monotonic_time())
